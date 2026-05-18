@@ -3,7 +3,6 @@
 Finalizes audio samples for distribution by:
 1. Normalizing audio to -1dB peak (preserves sample rate and bit depth)
 2. Detecting the musical key and appending it to the filename
-3. Detecting BPM for files whose names start with `loop` and appending it to the filename
 
 ## Usage
 
@@ -26,4 +25,4 @@ Finalizes audio samples for distribution by:
 
 Will normalize and rename:
 - `synth.wav` → `synth-Cm.wav` (C minor, normalized to -1dB)
-- `loop-bass.wav` → `loop-bass-G-131bpm.wav` (G major, 131 BPM, normalized to -1dB)
+- `bass.wav` → `bass-G.wav` (G major, normalized to -1dB)

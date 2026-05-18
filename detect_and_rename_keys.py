@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
 Detects the musical key of WAV files and renames them to include the key.
-For files starting with "loop", also detects BPM and appends it to the filename.
 
 Examples:
   audio.wav -> audio-Cm.wav
-  loop-audio.wav -> loop-audio-Cm-131bpm.wav
 
 Key detection uses the Krumhansl-Schmuckler algorithm:
   Krumhansl, C.L. & Kessler, E.J. (1982). Tracing the dynamic changes in
@@ -30,11 +28,10 @@ KEY_PROFILES = {
     'minor': [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
 }
 
-# Regexes that match metadata suffixes added by this tool.
+# Regex that matches key suffixes added by this tool.
 _KEY_SUFFIX_RE = re.compile(
     r'[-_](' + '|'.join(re.escape(k) for k in KEYS) + r')m?$'
 )
-_BPM_RE = re.compile(r'(^|[-_])\d+(?:\.\d+)?bpm($|[-_])', re.IGNORECASE)
 
 # Maximum audio duration (seconds) and sample rate used for analysis.
 _ANALYSIS_DURATION = 30
@@ -81,43 +78,19 @@ def detect_key(audio_path: str) -> tuple[str, float]:
     return key_name, best_r
 
 
-def detect_bpm(audio_path: str) -> int:
-    """Estimate tempo in BPM."""
-    y, sr = librosa.load(
-        audio_path,
-        sr=_ANALYSIS_SR,
-        duration=_ANALYSIS_DURATION,
-        mono=True,
-    )
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    tempo = float(np.asarray(tempo).squeeze())
-    return round(tempo)
-
-
 def _already_has_key(stem: str, key: str) -> bool:
     """Return True if *stem* already ends with the key suffix we would add."""
     return bool(_KEY_SUFFIX_RE.search(stem)) or key in stem
 
 
-def _already_has_bpm(stem: str) -> bool:
-    """Return True if *stem* already contains a BPM marker."""
-    return bool(_BPM_RE.search(stem))
-
-
-def _should_detect_bpm(stem: str) -> bool:
-    """Only loop-prefixed files get BPM metadata."""
-    return stem.lower().startswith('loop')
-
-
 def _process_one(wav_path: str, dry_run: bool) -> dict:
-    """Detect metadata for one file and optionally rename it. Returns a result dict."""
+    """Detect key for one file and optionally rename it. Returns a result dict."""
     p = Path(wav_path)
     result = {
         "file": p.name,
         "error": None,
         "key": None,
         "confidence": None,
-        "bpm": None,
         "renamed_to": None,
         "skipped": False,
         "dry_run": dry_run,
@@ -131,14 +104,6 @@ def _process_one(wav_path: str, dry_run: bool) -> dict:
         suffix_parts = []
         if not _already_has_key(p.stem, key):
             suffix_parts.append(key)
-
-        if _should_detect_bpm(p.stem):
-            if _already_has_bpm(p.stem):
-                result["bpm"] = "existing"
-            else:
-                bpm = detect_bpm(wav_path)
-                result["bpm"] = bpm
-                suffix_parts.append(f"{bpm}bpm")
 
         if suffix_parts:
             new_name = f"{p.stem}-{'-'.join(suffix_parts)}{p.suffix}"
@@ -162,7 +127,7 @@ def _find_wav_files(path: Path) -> list[Path]:
 
 
 def rename_files_with_keys(directory: str = ".", dry_run: bool = False, workers: int = 4) -> None:
-    """Process WAV files and rename them with detected key and loop BPM metadata."""
+    """Process WAV files and rename them with detected key metadata."""
     path = Path(directory)
     wav_files = _find_wav_files(path)
 
@@ -192,20 +157,15 @@ def _print_result(r: dict) -> None:
         return
 
     confidence_pct = f"{r['confidence']:.0%}"
-    bpm_text = ""
-    if isinstance(r["bpm"], int):
-        bpm_text = f", BPM: {r['bpm']}"
-    elif r["bpm"] == "existing":
-        bpm_text = ", BPM already in filename"
 
     print(f"\n  {name}")
     if r["skipped"]:
-        print(f"    Key: {r['key']} ({confidence_pct} confidence){bpm_text} - skipped")
+        print(f"    Key: {r['key']} ({confidence_pct} confidence) - skipped")
     elif r["renamed_to"]:
         action = "would rename to" if r["dry_run"] else "renamed to"
-        print(f"    Key: {r['key']} ({confidence_pct} confidence){bpm_text} - {action} {r['renamed_to']}")
+        print(f"    Key: {r['key']} ({confidence_pct} confidence) - {action} {r['renamed_to']}")
     else:
-        print(f"    Key: {r['key']} ({confidence_pct} confidence){bpm_text}")
+        print(f"    Key: {r['key']} ({confidence_pct} confidence)")
 
 
 def main() -> None:
