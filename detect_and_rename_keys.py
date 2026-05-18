@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 Detects the musical key of WAV files and renames them to include the key.
-Example: audio.wav -> audio_Cm.wav (for C minor)
+For files starting with "loop", also detects BPM and appends it to the filename.
+
+Examples:
+  audio.wav -> audio-Cm.wav
+  loop-audio.wav -> loop-audio-Cm-131bpm.wav
 
 Key detection uses the Krumhansl-Schmuckler algorithm:
   Krumhansl, C.L. & Kessler, E.J. (1982). Tracing the dynamic changes in
@@ -9,14 +13,13 @@ Key detection uses the Krumhansl-Schmuckler algorithm:
   Psychological Review, 89(4), 334-368.
 """
 
-import os
-import re
-import sys
 import argparse
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
 import librosa
 import numpy as np
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Key names for the 12 chromatic pitch classes
 KEYS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -27,13 +30,13 @@ KEY_PROFILES = {
     'minor': [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
 }
 
-# Regex that matches a key suffix added by this tool, e.g. _Cm or _F#
+# Regexes that match metadata suffixes added by this tool.
 _KEY_SUFFIX_RE = re.compile(
-    r'_(' + '|'.join(re.escape(k) for k in KEYS) + r')m?$'
+    r'[-_](' + '|'.join(re.escape(k) for k in KEYS) + r')m?$'
 )
+_BPM_RE = re.compile(r'(^|[-_])\d+(?:\.\d+)?bpm($|[-_])', re.IGNORECASE)
 
-# Maximum audio duration (seconds) and sample rate used for key detection.
-# Full files aren't needed — 30 s at 22 kHz is sufficient for chroma analysis.
+# Maximum audio duration (seconds) and sample rate used for analysis.
 _ANALYSIS_DURATION = 30
 _ANALYSIS_SR = 22050
 
@@ -44,7 +47,7 @@ def detect_key(audio_path: str) -> tuple[str, float]:
 
     Returns:
         (key_name, confidence) where key_name is e.g. "Cm" or "F#" and
-        confidence is the Pearson r of the best-matching profile (0–1).
+        confidence is the Pearson r of the best-matching profile (0-1).
     """
     y, sr = librosa.load(
         audio_path,
@@ -78,59 +81,107 @@ def detect_key(audio_path: str) -> tuple[str, float]:
     return key_name, best_r
 
 
+def detect_bpm(audio_path: str) -> int:
+    """Estimate tempo in BPM."""
+    y, sr = librosa.load(
+        audio_path,
+        sr=_ANALYSIS_SR,
+        duration=_ANALYSIS_DURATION,
+        mono=True,
+    )
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    tempo = float(np.asarray(tempo).squeeze())
+    return round(tempo)
+
+
 def _already_has_key(stem: str, key: str) -> bool:
     """Return True if *stem* already ends with the key suffix we would add."""
-    return bool(_KEY_SUFFIX_RE.search(stem))
+    return bool(_KEY_SUFFIX_RE.search(stem)) or key in stem
+
+
+def _already_has_bpm(stem: str) -> bool:
+    """Return True if *stem* already contains a BPM marker."""
+    return bool(_BPM_RE.search(stem))
+
+
+def _should_detect_bpm(stem: str) -> bool:
+    """Only loop-prefixed files get BPM metadata."""
+    return stem.lower().startswith('loop')
 
 
 def _process_one(wav_path: str, dry_run: bool) -> dict:
-    """Detect key for one file and optionally rename it. Returns a result dict."""
+    """Detect metadata for one file and optionally rename it. Returns a result dict."""
     p = Path(wav_path)
-    result = {"file": p.name, "error": None, "key": None, "confidence": None, "renamed_to": None, "skipped": False}
+    result = {
+        "file": p.name,
+        "error": None,
+        "key": None,
+        "confidence": None,
+        "bpm": None,
+        "renamed_to": None,
+        "skipped": False,
+        "dry_run": dry_run,
+    }
 
     try:
         key, confidence = detect_key(wav_path)
         result["key"] = key
         result["confidence"] = confidence
 
-        if _already_has_key(p.stem, key):
-            result["skipped"] = True
-        else:
-            new_name = f"{p.stem}_{key}{p.suffix}"
+        suffix_parts = []
+        if not _already_has_key(p.stem, key):
+            suffix_parts.append(key)
+
+        if _should_detect_bpm(p.stem):
+            if _already_has_bpm(p.stem):
+                result["bpm"] = "existing"
+            else:
+                bpm = detect_bpm(wav_path)
+                result["bpm"] = bpm
+                suffix_parts.append(f"{bpm}bpm")
+
+        if suffix_parts:
+            new_name = f"{p.stem}-{'-'.join(suffix_parts)}{p.suffix}"
             new_path = p.parent / new_name
             result["renamed_to"] = new_name
             if not dry_run:
                 p.rename(new_path)
+        else:
+            result["skipped"] = True
     except Exception as exc:
         result["error"] = str(exc)
 
     return result
 
 
+def _find_wav_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path] if path.suffix.lower() == ".wav" else []
+
+    return sorted(set(path.rglob("*.wav")) | set(path.rglob("*.WAV")))
+
+
 def rename_files_with_keys(directory: str = ".", dry_run: bool = False, workers: int = 4) -> None:
-    """Process all WAV files in *directory* and rename them with detected keys."""
-    directory = Path(directory)
-    wav_files = sorted(
-        set(directory.rglob("*.wav")) | set(directory.rglob("*.WAV"))
-    )
+    """Process WAV files and rename them with detected key and loop BPM metadata."""
+    path = Path(directory)
+    wav_files = _find_wav_files(path)
 
     if not wav_files:
-        print(f"No WAV files found in {directory}")
+        print(f"No WAV files found in {path}")
         return
 
     print(f"Found {len(wav_files)} WAV file(s)"
-          + (" [DRY RUN — no files will be renamed]" if dry_run else ""))
+          + (" [DRY RUN - no files will be renamed]" if dry_run else ""))
 
-    # Use parallel workers; fall back to serial for a single file
-    futures_map = {}
-    with ProcessPoolExecutor(max_workers=min(workers, len(wav_files))) as pool:
-        for wf in wav_files:
-            fut = pool.submit(_process_one, str(wf), dry_run)
-            futures_map[fut] = wf.name
+    max_workers = max(1, min(workers, len(wav_files)))
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures_map = {
+            pool.submit(_process_one, str(wf), dry_run): wf.name
+            for wf in wav_files
+        }
 
         for fut in as_completed(futures_map):
-            r = fut.result()
-            _print_result(r)
+            _print_result(fut.result())
 
 
 def _print_result(r: dict) -> None:
@@ -141,16 +192,20 @@ def _print_result(r: dict) -> None:
         return
 
     confidence_pct = f"{r['confidence']:.0%}"
+    bpm_text = ""
+    if isinstance(r["bpm"], int):
+        bpm_text = f", BPM: {r['bpm']}"
+    elif r["bpm"] == "existing":
+        bpm_text = ", BPM already in filename"
+
+    print(f"\n  {name}")
     if r["skipped"]:
-        print(f"\n  {name}")
-        print(f"    Key: {r['key']} ({confidence_pct} confidence) — already in filename, skipped")
+        print(f"    Key: {r['key']} ({confidence_pct} confidence){bpm_text} - skipped")
     elif r["renamed_to"]:
-        arrow = "would rename to" if r.get("dry_run") else "renamed to"
-        print(f"\n  {name}")
-        print(f"    Key: {r['key']} ({confidence_pct} confidence) → {r['renamed_to']}")
+        action = "would rename to" if r["dry_run"] else "renamed to"
+        print(f"    Key: {r['key']} ({confidence_pct} confidence){bpm_text} - {action} {r['renamed_to']}")
     else:
-        print(f"\n  {name}")
-        print(f"    Key: {r['key']} ({confidence_pct} confidence) → {r['renamed_to'] or 'renamed'}")
+        print(f"    Key: {r['key']} ({confidence_pct} confidence){bpm_text}")
 
 
 def main() -> None:
@@ -161,7 +216,7 @@ def main() -> None:
         "directory",
         nargs="?",
         default=".",
-        help="Directory to scan (default: current directory)",
+        help="Directory or WAV file to scan (default: current directory)",
     )
     parser.add_argument(
         "--dry-run",
